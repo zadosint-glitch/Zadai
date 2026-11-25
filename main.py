@@ -163,7 +163,7 @@ DEFAULTS = {
     "lang": "auto", "persona": "normal", "voice_on": "1", "image_on": "1", "daily_limit": str(DEFAULT_LIMIT),
     "maintenance": "0", "models": DEFAULT_MODELS, "assistant_name": "ZAD AI", "owner_name": "", "about": "",
     "greeting": "", "turns": "12", "business_on": "1", "handoff": "30", "temp": "0.9",
-    "quote_on": "1", "img_on": "1", "file_on": "1", "song_on": "1", "tts_on": "1", "search_on": "1", "fallback_img": "1",
+    "quote_on": "1", "img_on": "1", "file_on": "1", "song_on": "1", "tts_on": "1", "search_on": "0", "fallback_img": "1",
     "song_full": "0", "daily_report": "1", "img_limit": "5", "song_limit": "2", "voice_limit": "10", "ref_bonus": "5",
     "force_chat": "", "img_models": "auto", "song_models": "auto", "tts_models": "auto", "groq_model": "auto",
 }
@@ -555,6 +555,7 @@ class BadReq(AIError):
 
 CD = {}  # (key_id, model) -> unix time until usable
 TL = threading.local()
+NOTOOLS = set()  # models where live search/url tools hit quota -> stop sending tools
 
 
 def mask(k):
@@ -652,7 +653,7 @@ def generate(system, contents, _retry=True, tools=None):
             gc["thinkingConfig"] = {"thinkingBudget": 0}
         body = {"systemInstruction": {"parts": [{"text": system}]}, "contents": contents,
                 "generationConfig": gc, "safetySettings": safety}
-        if tools:
+        if tools and model not in NOTOOLS:
             body["tools"] = tools
         for k in avail_keys(model):
             db.x("UPDATE keys SET last_used=? WHERE id=?", (now(), k["id"]))
@@ -665,12 +666,14 @@ def generate(system, contents, _retry=True, tools=None):
                     code, data = gem_post(k["key"], model, body)
                     err = data.get("error") or {}
                     msg = err.get("message", "")
-                if tools and "tools" in body and code in (400, 403, 404, 429) and "api key" not in msg.lower() \
-                        and re.search(r"search|ground|tool|url_context|url context", msg, re.I):
-                    body.pop("tools", None)  # live search not allowed for this key/model: retry without it
+                if "tools" in body and code in (400, 403, 404, 429) and "api key" not in msg.lower() \
+                        and (code == 429 or re.search(r"search|ground|tool|url_context|url context", msg, re.I)):
+                    body.pop("tools", None)  # live search has no quota/permission here: retry without it
                     code, data = gem_post(k["key"], model, body)
                     err = data.get("error") or {}
                     msg = err.get("message", "")
+                    if code == 200:
+                        NOTOOLS.add(model)
             except requests.RequestException as e:
                 last = "network: %s" % e
                 CD[(k["id"], model)] = now() + 10
@@ -678,7 +681,7 @@ def generate(system, contents, _retry=True, tools=None):
             if code == 200:
                 db.x("UPDATE keys SET calls=calls+1,last_error='' WHERE id=?", (k["id"],))
                 return extract_text(data)
-            last = "%s %s" % (code, msg[:120])
+            last = "%s %s" % (code, msg[:300])
             if code == 429:
                 daily = "PerDay" in json.dumps(err) or "per day" in msg.lower()
                 until = pacific_reset_ts() if daily else now() + int(min((parse_retry(err) or 60) + 2, 180))
